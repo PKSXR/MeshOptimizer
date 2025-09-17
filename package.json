@@ -2,7 +2,6 @@
   "name": "rapidpipeline-optimizer",
   "version": "1.0.0",
   "description": "Upload → Optimize → Download (RapidPipeline) with server-side token",
-  "type": "module",
   "scripts": {
     "dev": "node server.js",
     "start": "NODE_ENV=production node server.js"
