@@ -29,6 +29,11 @@
                     <input type="file" @change="onFile" />
                 </div>
 
+                <!-- Show file hash for debugging -->
+                <div v-if="currentFileHash" class="text-xs opacity-70">
+                    File hash: {{ currentFileHash.substring(0, 16) }}...
+                </div>
+
                 <div class="flex gap-3">
                     <button class="px-4 py-2 rounded bg-amber-600 text-white disabled:opacity-50"
                         :disabled="!file || busy" @click="startFlow">
@@ -96,10 +101,7 @@ import { reactive, ref, computed, onMounted, onBeforeUnmount } from 'vue'
 const modelName = ref<string>('')
 const presetId = ref<number>(9547)
 const file = ref<File | null>(null)
-// top of <script setup>
-const ENABLE_GLB_NUDGE = false; // turn off for now
-let glbNudged = false;
-
+const currentFileHash = ref<string>('')
 
 const busy = ref(false)
 const statusMsg = ref('')
@@ -108,6 +110,7 @@ const error = ref<string | null>(null)
 const rawmodelId = ref<number | null>(null)
 const rapidmodelId = ref<number | null>(null)
 const downloads = ref<Array<{ format: string; url: string }>>([])
+
 const ETA_DEFAULTS: Record<string, number> = {
     queued: 45_000,      // 45s default
     processing: 240_000, // 4m default
@@ -125,6 +128,7 @@ function updateAvgMs(stage: 'queued' | 'processing', sampleMs: number) {
     const next = Math.round((1 - alpha) * prev + alpha * sampleMs);
     localStorage.setItem(`etaAvg_${stage}`, String(next));
 }
+
 // progress UI state
 const state = reactive({
     progress: 0,
@@ -142,9 +146,25 @@ const indeterminate = computed(() => state.indeterminate)
 let stop = false
 
 // ---------------- File handlers ----------------
-function onFile(e: Event) {
+async function onFile(e: Event) {
     const input = e.target as HTMLInputElement
-    file.value = input.files?.[0] || null
+    const selectedFile = input.files?.[0] || null
+    file.value = selectedFile
+
+    // Compute hash immediately when file is selected
+    if (selectedFile) {
+        try {
+            statusMsg.value = 'Computing file hash...'
+            currentFileHash.value = await sha256File(selectedFile)
+            statusMsg.value = ''
+            console.log(`[Hash] File hash computed: ${currentFileHash.value}`)
+        } catch (err) {
+            console.error('Error computing hash:', err)
+            currentFileHash.value = ''
+        }
+    } else {
+        currentFileHash.value = ''
+    }
 }
 
 function filenameFromUrl(url: string) {
@@ -157,6 +177,7 @@ function filenameFromUrl(url: string) {
         return 'file'
     }
 }
+
 async function debugAsset() {
     if (!rawmodelId.value) return;
 
@@ -184,6 +205,7 @@ async function debugAsset() {
         alert('Debug failed: ' + err.message);
     }
 }
+
 // ---------------- Crypto helper (SHA-256) ----------------
 async function sha256File(f: File): Promise<string> {
     const buf = await f.arrayBuffer()
@@ -204,12 +226,59 @@ async function backend(path: string, init?: RequestInit) {
     return data
 }
 
-// ---------------- Poller (EMA ETA + backoff + indeterminate) ----------------
-let lastProgress = 0
-let lastTick = performance.now()
-let emaSpeed = 0 // % per ms
-let flatTicks = 0
+// ---------------- Enhanced hash checking ----------------
+async function findExistingByHash(hash: string): Promise<{ found: boolean, id?: number, name?: string }> {
+    try {
+        console.log(`[Dedup] Checking for existing asset with hash: ${hash}`)
 
+        const response = await backend(`/api/find-by-hash?hash=${encodeURIComponent(hash)}`)
+
+        if (response.found && response.id) {
+            console.log(`[Dedup] Found existing asset: ID ${response.id}, name: ${response.name}`)
+            return {
+                found: true,
+                id: response.id,
+                name: response.name
+            }
+        }
+
+        console.log(`[Dedup] No existing asset found for hash`)
+        return { found: false }
+
+    } catch (err) {
+        console.warn(`[Dedup] Error checking hash: ${err.message}`)
+        return { found: false }
+    }
+}
+
+// ---------------- Enhanced tagging after upload ----------------
+async function ensureHashTags(rawId: number, hash: string, filename: string) {
+    try {
+        console.log(`[Tags] Adding hash tags to asset ${rawId}`)
+
+        // Add multiple tag formats to ensure we can find it later
+        const tags = [
+            `sha256-${hash}`,           // Safe format (no special chars)
+            `hash:${hash}`,             // Legacy format with colon
+            `filename:${filename}`,     // Filename tag
+            `content-hash-${hash.substring(0, 16)}` // Shortened version
+        ]
+
+        await backend(`/api/rawmodel/${rawId}/tags`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tags })
+        })
+
+        console.log(`[Tags] Successfully added ${tags.length} tags to asset ${rawId}`)
+
+    } catch (err) {
+        console.warn(`[Tags] Failed to add tags: ${err.message}`)
+        // Don't fail the entire flow if tagging fails
+    }
+}
+
+// ---------------- Poller (same as before) ----------------
 function sleep(ms: number) { return new Promise(r => setTimeout(r, ms)) }
 function humanizeMs(ms: number) {
     const s = Math.max(0, Math.round(ms / 1000));
@@ -218,30 +287,27 @@ function humanizeMs(ms: number) {
     return m > 0 ? `${m}m ${rem}s` : `${rem}s`;
 }
 function progressForStage(stage: 'queued' | 'processing', elapsedMs: number, avgMs: number) {
-    // ease-out curve
     const t = Math.min(1, elapsedMs / Math.max(1, avgMs));
-    const eased = 1 - Math.pow(1 - t, 2); // quadratic ease-out
+    const eased = 1 - Math.pow(1 - t, 2);
 
     if (stage === 'queued') {
-        const start = 20, end = 50; // 20% -> 50%
+        const start = 20, end = 50;
         return start + eased * (end - start);
     } else {
-        const start = 50, end = 95; // 50% -> 95%
+        const start = 50, end = 95;
         return start + eased * (end - start);
     }
 }
-// ---------------- Improved poller: stage-based, time-driven ETA ----------------
-// Replace the pollStatus function in your App.vue with this improved version
+
 async function pollStatus(rawId: number) {
     let delay = 1000;
     let currentStage: 'waiting' | 'queued' | 'processing' | 'ready' | 'unknown' = 'waiting';
-    let stuckAt95Count = 0; // Counter for how long we've been stuck at 95%
-    let maxStuckRetries = 10; // Maximum retries when stuck
+    let stuckAt95Count = 0;
+    let maxStuckRetries = 10;
 
     let queueStart = 0;
     let procStart = 0;
 
-    // reset UI
     state.progress = 0;
     state.stage = 'waiting';
     state.eta = 'Calculating…';
@@ -260,7 +326,6 @@ async function pollStatus(rawId: number) {
 
             console.log(`[Poll] Stage: ${stage}, Progress: ${p}%, Downloads: ${status.downloads?.length || 0}`);
 
-            // Handle stuck at 95% case
             if (p >= 95 && p < 100 && (!Array.isArray(status.downloads) || status.downloads.length === 0)) {
                 stuckAt95Count++;
                 console.log(`[Poll] Stuck at ${p}% for ${stuckAt95Count} iterations`);
@@ -279,15 +344,13 @@ async function pollStatus(rawId: number) {
                         console.warn('add-formats network error:', err);
                     }
 
-                    // Reset counter after nudge
                     stuckAt95Count = 0;
-                    maxStuckRetries = 15; // Give it more time after nudge
+                    maxStuckRetries = 15;
                 }
             } else {
-                stuckAt95Count = 0; // Reset counter if we're not stuck
+                stuckAt95Count = 0;
             }
 
-            // Stage transitions
             if (stage !== currentStage) {
                 console.log(`[Poll] Stage transition: ${currentStage} → ${stage}`);
 
@@ -305,7 +368,6 @@ async function pollStatus(rawId: number) {
                 currentStage = stage;
             }
 
-            // Compute ETA + progress based on time-in-stage
             if (stage === 'queued') {
                 const avg = getAvgMs('queued');
                 const elapsed = now - (queueStart || startedAt);
@@ -350,11 +412,9 @@ async function pollStatus(rawId: number) {
                 state.indeterminate = true;
             }
 
-            // Cap and set progress
             state.progress = Math.min(100, Math.max(state.progress, p));
             state.stage = stage;
 
-            // Expose rapidmodelId + downloads if present
             if (status.rapidmodelId) rapidmodelId.value = Number(status.rapidmodelId);
 
             if (Array.isArray(status.downloads) && status.downloads.length > 0) {
@@ -362,7 +422,6 @@ async function pollStatus(rawId: number) {
                 console.log(`[Poll] Downloads available: ${status.downloads.length} files`);
             }
 
-            // Exit conditions
             if (stage === 'ready' && Array.isArray(status.downloads) && status.downloads.length > 0) {
                 console.log('[Poll] Optimization complete with downloads');
                 break;
@@ -373,11 +432,10 @@ async function pollStatus(rawId: number) {
                 break;
             }
 
-            // Adaptive delay
             if (p >= 95 && stage === 'processing') {
-                delay = Math.min(3000, delay); // Check more frequently when close to done
+                delay = Math.min(3000, delay);
             } else {
-                delay = Math.min(8000, Math.floor(delay * 1.2)); // Normal backoff
+                delay = Math.min(8000, Math.floor(delay * 1.2));
             }
 
         } catch (err) {
@@ -390,15 +448,7 @@ async function pollStatus(rawId: number) {
     }
 }
 
-
-function updateUI(p: number, st: string, etaText: string, ind: boolean) {
-    state.progress = p
-    state.stage = st
-    state.eta = etaText
-    state.indeterminate = ind
-}
-
-// ---------------- Main flow ----------------
+// ---------------- Enhanced main flow with better deduplication ----------------
 async function startFlow() {
     error.value = null
     statusMsg.value = ''
@@ -411,30 +461,43 @@ async function startFlow() {
 
     try {
         busy.value = true
-        statusMsg.value = 'Hashing file for idempotent upload…'
-        const contentHash = await sha256File(file.value)
 
-        // 1) See if an exact asset already exists (skip upload if so)
-        const found = await backend(`/api/find-by-hash?hash=${encodeURIComponent(contentHash)}`)
-        if (found?.found && found.id) {
-            rawmodelId.value = Number(found.id)
-            statusMsg.value = `Found existing asset (#${rawmodelId.value}). Skipping upload…`
+        // Use pre-computed hash if available, otherwise compute it
+        let contentHash = currentFileHash.value
+        if (!contentHash) {
+            statusMsg.value = 'Computing file hash for deduplication…'
+            contentHash = await sha256File(file.value)
+            currentFileHash.value = contentHash
+        }
+
+        console.log(`[Flow] Starting with file hash: ${contentHash}`)
+
+        // 1) Check for existing asset with strong deduplication
+        statusMsg.value = 'Checking for existing identical assets…'
+        const existing = await findExistingByHash(contentHash)
+
+        if (existing.found && existing.id) {
+            rawmodelId.value = Number(existing.id)
+            statusMsg.value = `Found existing asset (#${rawmodelId.value}: "${existing.name}"). Skipping upload…`
+            console.log(`[Flow] Using existing asset: ${rawmodelId.value}`)
         } else {
-            // 2) Ask server to start upload
-            statusMsg.value = 'Creating upload session…'
+            // 2) Start new upload
+            statusMsg.value = 'Creating new upload session…'
             const start = await backend('/api/start-upload', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     modelName: modelName.value || file.value.name,
                     filename: file.value.name,
-                    contentHash
+                    contentHash: contentHash
                 })
             })
 
             rawmodelId.value = Number(start.id)
+            console.log(`[Flow] Created upload session: ${rawmodelId.value}`)
+
             if (!start.exists) {
-                // 3) PUT file to signed URL directly
+                // 3) Upload file
                 statusMsg.value = 'Uploading to storage…'
                 const put = await fetch(start.signedUrl, {
                     method: 'PUT',
@@ -443,13 +506,21 @@ async function startFlow() {
                 })
                 if (!put.ok) throw new Error(`S3 PUT failed: ${put.status} ${put.statusText}`)
 
-                // 4) Tell RP upload is complete
+                // 4) Complete upload
                 statusMsg.value = 'Finalizing upload…'
                 await backend(`/api/complete-upload/${rawmodelId.value}`, { method: 'POST' })
+
+                // 5) Add hash tags immediately after upload
+                statusMsg.value = 'Adding deduplication tags…'
+                await ensureHashTags(rawmodelId.value, contentHash, file.value.name)
+
+                console.log(`[Flow] Upload completed and tagged: ${rawmodelId.value}`)
+            } else {
+                console.log(`[Flow] Upload session found existing file: ${rawmodelId.value}`)
             }
         }
 
-        // 5) Request optimize with your preset
+        // 6) Request optimization
         statusMsg.value = 'Requesting optimization…'
         await backend('/api/optimize', {
             method: 'POST',
@@ -457,13 +528,13 @@ async function startFlow() {
             body: JSON.stringify({ rawmodelId: rawmodelId.value, presetId: presetId.value })
         })
 
-        // 6) Poll status until ready
-        statusMsg.value = 'Tracking status…'
+        // 7) Poll status until ready
+        statusMsg.value = 'Tracking optimization progress…'
         await pollStatus(rawmodelId.value!)
-        statusMsg.value = 'Completed.'
+        statusMsg.value = 'Optimization completed!'
 
     } catch (e: any) {
-        console.error(e)
+        console.error('[Flow] Error:', e)
         error.value = e?.message || String(e)
         statusMsg.value = ''
     } finally {
@@ -478,11 +549,12 @@ function cancel() {
 }
 
 onBeforeUnmount(() => { stop = true })
-onMounted(() => { /* optional boot logic */ })
+onMounted(() => {
+    console.log('[App] Mesh Optimizer loaded')
+})
 </script>
 
 <style>
-/* Optional: dark scrollbars */
 :root {
     color-scheme: light dark;
 }
