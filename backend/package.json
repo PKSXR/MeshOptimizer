@@ -1,0 +1,20 @@
+{
+  "name": "rapidpipeline-optimizer",
+  "version": "1.0.0",
+  "description": "Upload → Optimize → Download (RapidPipeline) with server-side token",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "NODE_ENV=production node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.21.2",
+    "morgan": "^1.10.1",
+    "node-fetch": "^3.3.2"
+  },
+  "main": "server.js",
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
